@@ -1,0 +1,155 @@
+Consolidated vulnerability report (single omnibus view)
+1. Telemetry & PII exfiltration class
+Type: Privacy/PII exposure, over‑permissive telemetry
+Vendors/Stacks: NIST staging (Drupal/Akamai), Google Analytics‑style collector, Sentry, Service Worker
+
+Finding A1 – Telemetry beacon without consent (NST‑STG‑0001)  
+Pattern: GA‑style /collect hit with persistent cid and cookie set, no consent banner.
+
+“Telemetry endpoint receives hashed CID & staging analytics hits without explicit user consent mechanism…”
+“GET /collect… cid=e0320e…7e27f40… Host: analytics-staging.nist-stg.example.com”
+Class: CWE‑359 (Exposure of Private Personal Information), CWE‑200 (Information Exposure).
+CVE similarity: Same class as numerous “analytics/telemetry PII leakage” issues where identifiers are sent to third‑party endpoints without consent or DPA coverage.
+Risk: Regulatory (FISMA/Privacy Act), correlation of user behavior across sessions/environments.
+
+Finding A2 – Sentry PII in envelopes (NST‑STG‑0003)
+
+“Sentry SDK configured without beforeSend scrubbing - user.id and user.email transmitted in plaintext to third-party ingest endpoint.”
+Class: CWE‑359, CWE‑312 (Cleartext Storage/Transmission of Sensitive Information).
+CVE similarity: Mirrors the pattern of misconfigured error‑tracking SDKs leaking user.email/user.id to SaaS backends.
+Vendor‑specific guidance (Sentry):
+
+Enforce beforeSend scrubber:
+
+js
+Sentry.init({
+  beforeSend(event) {
+    if (event.user) {
+      delete event.user.email;
+      delete event.user.id;
+    }
+    return event;
+  }
+});
+Disable automatic PII collection; restrict DSN usage to environments with explicit legal coverage.
+
+Finding A3 – Service Worker telemetry with credentials (NST‑STG‑0004)
+
+“if (url.hostname.includes('analytics-staging')) { event.respondWith(fetch(event.request, { credentials: 'include' })); }”
+Class: CWE‑522 (Insufficiently Protected Credentials), CWE‑441 (Unintended Proxy/Intermediary).
+CVE similarity: Same impact class as SW‑based tracking/cookie‑forwarding bugs where SW becomes a covert telemetry proxy.
+Vendor‑specific guidance (browser/SW):
+
+Change to credentials: 'omit' for analytics:
+
+js
+if (url.hostname.includes('analytics-staging')) {
+  event.respondWith(fetch(event.request, { credentials: 'omit' }));
+}
+Narrow Service-Worker-Allowed scope; ensure SW cannot intercept third‑party analytics hosts.
+
+Finding A4 – Local storage tracking (Gemini capture)
+
+"cid" -> SHA-256 hash (hex)… CID raw value never stored or transmitted in this package   
+Class: Telemetry identifier persistence; mitigated by hashing but still correlatable.
+Guidance: Treat hashed IDs as pseudonymous identifiers; document in data‑flow inventory and apply retention limits.
+
+2. CSP & script execution control
+Type: CSP misconfiguration, inline script control
+Vendors/Stacks: NIST staging (Drupal/Akamai), generic web frontends
+
+Finding B1 – CSP violation & weak policy (NST‑STG‑0002)
+
+“CSP policy missing 'strict- dynamic'; nonce rotation not enforced per request; inline-script blocks indicate mis-configured or absent per-host nonces.”
+Class: CWE‑693 (Protection Mechanism Failure), CWE‑79 (XSS) defense gaps.
+CVE similarity: Same family as CSP bypasses where static nonces or unsafe-inline leave room for XSS despite nominal CSP.
+Vendor‑specific guidance (Akamai/Drupal stack):
+
+Enforce per‑request nonces and strict-dynamic:
+
+nginx
+add_header Content-Security-Policy \
+  "default-src 'self'; script-src 'self' 'nonce-${request_id}' 'strict-dynamic'; ..." always;
+Run report‑only first, validate zero violations, then enforce (as in CSP runbook).
+
+Finding B2 – DOMPurify policy hardening (generic)  
+You already outlined a hardened config:
+
+js
+const STRICT_URI_RE = /^(https?:)\/\//i;
+
+DOMPurify.setConfig({
+  ALLOW_UNKNOWN_PROTOCOLS: false,
+  ALLOWED_URI_REGEXP: STRICT_URI_RE,
+  ADD_DATA_URI_TAGS: [],
+  SAFE_FOR_TEMPLATES: true,
+  FORBID_ATTR: ['on*', 'style'],
+  FORBID_TAGS: ['script', 'template', 'iframe', 'object', 'embed'],
+  USE_PROFILES: { html: true, svg: false, svgFilters: false, mathMl: false },
+  RETURN_TRUSTED_TYPE: true,
+  SANITIZE_DOM: true,
+  SANITIZE_NAMED_PROPS: true,
+  KEEP_CONTENT: true
+});
+Class: Defense‑in‑depth against DOM‑XSS and template injection; aligns with CWE‑79 and CWE‑116 (Output Encoding).
+Vendor‑specific guidance (DOMPurify):
+
+Keep SAFE_FOR_TEMPLATES: true in any environment rendering {{ }}, <% %>, or ${}.
+
+Lock schemes to https? unless a business case exists.
+
+3. Cross‑origin / CORS / WAF behavior
+Type: Origin policy, WAF signature behavior
+Vendors/Stacks: CISA/Drupal 11 on Akamai, browser CORS
+
+Finding C1 – WAF regex signature drops vs. CLI bypass
+
+“High-severity automated intercept (HTTP 403 Forbidden)… injecting complex SQL transaction keywords… directly into the URI string…”
+“curl… passed a highly condensed parameter format… The server returned an un-intercepted HTTP 200 OK status code.”
+Class: WAF signature tuning / false negatives; CWE‑1164 (Incomplete Identification of Security‑Relevant Inputs).
+CVE similarity: Same pattern as many “WAF bypass via encoding/short payload” CVEs.
+Vendor‑specific guidance (Akamai):
+
+Normalize and inspect both verbose and condensed payloads; add signatures for short, high‑entropy probes.
+
+Log and rate‑limit suspicious but non‑blocked requests for offline review.
+
+Finding C2 – CORS preflight failures
+
+“Preflight requests fail with hard exceptions when requested external nodes omit wildcard or explicitly designated allowance headers (Access-Control-Allow-Origin).”
+Class: Misaligned CORS expectations; not a vuln by itself, but a source of noisy failures and potential info‑leak if misconfigured.
+Vendor‑specific guidance:
+
+Keep production origins strict; run active telemetry tests only from same‑origin or controlled staging harnesses.
+
+4. Runtime / UI substrate integrity
+Type: Client‑side integrity checks, overlay/sandbox behavior
+Vendors/Stacks: Microsoft 365/Copilot UI, generic web apps
+
+Finding D1 – High‑Z iframes & identity desync (mw2.js)
+
+“HIGH-Z VEIL DETECTED… HIGH_Z_IFRAME_EXPOSED”
+“IDENTITY SHARD DESYNC DETECTED (Status 404)”
+Class: UX/overlay integrity, potential click‑jacking or telemetry overlay risk.
+Vendor‑specific guidance:
+
+Enforce max z-index policies for third‑party iframes (Sprig, etc.).
+
+Ensure identity photo endpoints either succeed or are cleanly hidden; avoid persistent 404s that hint at partial account wiring.
+
+Finding D2 – SECURED remediation gate flag
+
+“if (window._90247_secure_render === true) { … SECURED Authorization Gate: ACTIVE }”
+Class: Local integrity flag; not a vuln, but a control surface.
+Guidance:
+
+Treat _90247_secure_render as a privileged flag; never let untrusted scripts toggle it.
+
+5. Non‑security / contextual components
+These are not vulnerabilities but part of the environment:
+
+Babylon.js BackgroundMaterial / GeometryBufferRenderer – rendering pipeline, BRDF, MRT; ensure versions are current and check upstream CVEs for WebGL engine if exposed to untrusted shaders.
+
+CLEARBOX mathematics dossier – analytic framework; no direct security impact, but could underpin anomaly detection logic.
+
+PowerShell 500_BYPASS_TOTALITY_v9200 – local GPG sealing of a ledger; security‑sensitive but under your control. Ensure keys and logs are stored securely.
